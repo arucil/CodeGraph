@@ -729,6 +729,10 @@ impl QueryEngine {
         let mut since_checkpoint = 0usize;
 
         while pos < total {
+            // Native embedding is synchronous. Yield between batches so a
+            // dropped workspace can cancel this task instead of retaining its
+            // graph and vectors until the whole corpus has finished.
+            tokio::task::yield_now().await;
             let end = (pos + chunk_size).min(total);
             let chunk_refs: Vec<&str> = texts[pos..end].iter().map(|s| s.as_str()).collect();
 
@@ -879,6 +883,9 @@ impl QueryEngine {
         let mut embedded = 0usize;
 
         while pos < total {
+            // Even uncontended vector locks may be ready immediately: make
+            // cancellation and other workspaces runnable between native batches.
+            tokio::task::yield_now().await;
             let end = (pos + chunk_size).min(total);
             let chunk_refs: Vec<&str> = texts[pos..end].iter().map(|s| s.as_str()).collect();
 
@@ -3008,6 +3015,92 @@ mod tests {
         ));
         let engine = QueryEngine::new(Arc::clone(&graph));
         (engine, graph)
+    }
+
+    async fn cancellable_embedding_engine() -> Arc<QueryEngine> {
+        // A tiny local model exercises the real embedding loop without network
+        // access, ONNX, or any user's persisted graph/model files.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("config.json"),
+            r#"{"normalize":true,"hidden_dim":2}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("tokenizer.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [], "normalizer": null,
+                "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null, "decoder": null,
+                "model": {"type": "WordLevel", "vocab": {"[UNK]": 0, "symbol": 1},
+                          "unk_token": "[UNK]"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut header = serde_json::to_vec(&serde_json::json!({
+            "embeddings": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]}
+        }))
+        .unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut tensor = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        tensor.extend(header);
+        for value in [0.0_f32, 0.0, 1.0, 0.0] {
+            tensor.extend(value.to_le_bytes());
+        }
+        std::fs::write(directory.path().join("model.safetensors"), tensor).unwrap();
+        let vector_engine = Arc::new(VectorEngine::with_static_model(directory.path()).unwrap());
+        let (engine, graph) = create_test_engine().await;
+        {
+            let mut graph = graph.write().await;
+            for index in 0..128 {
+                let mut properties = PropertyMap::new();
+                properties.insert(
+                    "name".to_string(),
+                    codegraph::PropertyValue::String(format!("symbol_{index}")),
+                );
+                graph.add_node(NodeType::Function, properties).unwrap();
+            }
+        }
+        engine.set_vector_engine(vector_engine).await;
+        Arc::new(engine)
+    }
+
+    #[tokio::test]
+    async fn embedding_build_yields_and_releases_backend_when_cancelled() {
+        let engine = cancellable_embedding_engine().await;
+        let weak = Arc::downgrade(&engine);
+        let mut task = tokio_test::task::spawn(async move {
+            engine.build_symbol_vectors_checkpointed(None).await;
+        });
+
+        assert!(
+            task.poll().is_pending(),
+            "native batches ran to completion without a cancellation point"
+        );
+        drop(task);
+
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn embedding_resume_yields_and_releases_backend_when_cancelled() {
+        let engine = cancellable_embedding_engine().await;
+        let weak = Arc::downgrade(&engine);
+        let mut task = tokio_test::task::spawn(async move {
+            engine.embed_missing_symbols_checkpointed(None).await;
+        });
+
+        assert!(
+            task.poll().is_pending(),
+            "resumed native batches ran to completion without a cancellation point"
+        );
+        drop(task);
+
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

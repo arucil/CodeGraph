@@ -14,6 +14,7 @@
 //!
 //! The MCP server communicates via stdio using JSON-RPC 2.0.
 
+mod background_tasks;
 pub mod engine;
 pub mod file_watcher;
 pub mod pro_hooks;
@@ -22,6 +23,8 @@ pub mod resources;
 pub mod server;
 pub mod tools;
 pub mod transport;
+#[cfg(unix)]
+mod workspace_registry;
 
 pub use protocol::*;
 pub use server::McpServer;

@@ -82,6 +82,7 @@ fn serialize_tool_result_mode(result: &Value, pretty: bool) -> String {
     }
 }
 
+use super::background_tasks::BackgroundTasks;
 use super::protocol::*;
 use super::resources::get_all_resources;
 use super::tools::{get_all_tools, tool_in_profile, ToolProfile};
@@ -124,6 +125,9 @@ pub struct McpBackend {
     /// For CI / one-shot runs where semantic search isn't needed.
     /// Avoids loading the ~100MB ONNX model entirely.
     pub graph_only: bool,
+    /// Embedding work belongs to this backend, not to the shared engine's
+    /// lifetime. Dropping the last backend clone aborts its pending work.
+    background_tasks: Arc<BackgroundTasks>,
 }
 
 /// Outcome of the startup poison-detection pass, persisted as
@@ -246,6 +250,7 @@ impl McpBackend {
             indexer,
             index_state,
             graph_only: false,
+            background_tasks: Arc::new(BackgroundTasks::default()),
         }
     }
 
@@ -1034,7 +1039,7 @@ impl McpBackend {
                     // work) when the set is actually complete.
                     let query_engine = Arc::clone(&self.query_engine);
                     let slug = self.project_slug.clone();
-                    tokio::spawn(async move {
+                    self.background_tasks.spawn(async move {
                         let _phase = crate::crash_phase::enter("index_embed");
                         query_engine
                             .embed_missing_symbols_checkpointed(Some(&slug))
@@ -1056,7 +1061,7 @@ impl McpBackend {
                         "Starting background embedding generation ({} symbols)...",
                         self.query_engine.symbol_count().await
                     );
-                    tokio::spawn(async move {
+                    self.background_tasks.spawn(async move {
                         // Embedding runs native ONNX over symbol bodies — the
                         // other suspect for the win32 0xC0000005 crashes. Guard
                         // resets to `serving` when the background task finishes.
@@ -1342,13 +1347,16 @@ impl McpServer {
         self.execute_tool(tool_name, tool_args).await
     }
 
-    /// Inject a shared VectorEngine (Model B engine) before indexing so this
-    /// workspace reuses the one model instead of loading its own.
+    /// Reuse the Model B engine's loaded model, but own the cache per workspace
+    /// so its texts and vectors are released with the workspace backend.
     pub(crate) async fn set_shared_engine(
         &self,
         engine: std::sync::Arc<codegraph_memory::VectorEngine>,
     ) {
-        self.backend.memory_manager.set_engine(engine).await;
+        self.backend
+            .memory_manager
+            .set_engine(Arc::new(engine.with_shared_model()))
+            .await;
     }
 
     /// Ensure workspace is indexed (lazy — runs on first tool call, or once at

@@ -8,6 +8,7 @@
 //! graph: removes old nodes, re-parses changed files, re-indexes dependents,
 //! resolves cross-file imports, and rebuilds search indexes.
 
+use super::background_tasks::BackgroundTasks;
 use crate::ai_query::QueryEngine;
 use crate::indexer::{IndexConfig, WorkspaceFilter};
 use crate::parser_registry::ParserRegistry;
@@ -25,6 +26,9 @@ const DEBOUNCE_MS: u64 = 2000;
 
 /// Watches workspace directories for file changes and auto-indexes them.
 pub struct McpFileWatcher {
+    // Cancel an in-flight batch too, not just the idle event receiver. Notify's
+    // sender closing cannot stop a batch that is awaiting a graph lock.
+    _tasks: BackgroundTasks,
     _watcher: RecommendedWatcher,
 }
 
@@ -84,7 +88,8 @@ impl McpFileWatcher {
             filter: WorkspaceFilter::new(directories, config),
         };
 
-        tokio::spawn(async move {
+        let tasks = BackgroundTasks::default();
+        tasks.spawn(async move {
             let debounce = Duration::from_millis(DEBOUNCE_MS);
             let mut pending: HashSet<PathBuf> = HashSet::new();
             let mut deleted: HashSet<PathBuf> = HashSet::new();
@@ -137,7 +142,10 @@ impl McpFileWatcher {
         let watch_count = directories.len();
         tracing::info!("MCP file watcher started ({} directories)", watch_count);
 
-        Ok(McpFileWatcher { _watcher: watcher })
+        Ok(McpFileWatcher {
+            _tasks: tasks,
+            _watcher: watcher,
+        })
     }
 }
 
@@ -289,4 +297,58 @@ async fn process_changes(ctx: &WatcherCtx, changed: &[PathBuf], removed: &[PathB
         "[file-watcher] Indexed {} files (incl. dependents), indexes rebuilt",
         indexed
     );
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_watcher_releases_resources_with_a_batch_blocked_on_graph() {
+        let directory = tempfile::tempdir().unwrap();
+        let directories = vec![directory.path().to_path_buf()];
+        let config = IndexConfig::default();
+        let graph = Arc::new(RwLock::new(CodeGraph::in_memory().unwrap()));
+        let parsers = Arc::new(ParserRegistry::new());
+        let query = Arc::new(QueryEngine::new(Arc::clone(&graph)));
+        let weak_query = Arc::downgrade(&query);
+        let weak_parsers = Arc::downgrade(&parsers);
+        let watcher = McpFileWatcher::start(
+            Arc::clone(&graph),
+            Arc::clone(&parsers),
+            Arc::clone(&query),
+            &directories,
+            &config,
+        )
+        .unwrap();
+
+        // A closing Notify channel alone cannot interrupt process_changes
+        // while it awaits this lock. Keep it locked until release is proved.
+        let locked = graph.write().await;
+        let ctx = WatcherCtx {
+            graph: Arc::clone(&graph),
+            parsers,
+            query_engine: query,
+            supported_extensions: Vec::new(),
+            filter: WorkspaceFilter::new(&directories, &config),
+        };
+        let (started, ready) = tokio::sync::oneshot::channel();
+        watcher._tasks.spawn(async move {
+            started.send(()).unwrap();
+            process_changes(&ctx, &[], &[]).await;
+        });
+        ready.await.unwrap();
+
+        drop(watcher);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while weak_query.upgrade().is_some() || weak_parsers.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed watcher retained a batch and its workspace resources");
+        drop(locked);
+        assert_eq!(Arc::strong_count(&graph), 1);
+    }
 }

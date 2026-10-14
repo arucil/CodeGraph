@@ -72,6 +72,17 @@ impl VectorEngine {
         }
     }
 
+    /// Reuse the loaded model, but give a workspace its own embedding cache.
+    /// Sharing a whole VectorEngine would keep every disconnected workspace's
+    /// input texts and vectors in the resident engine for its entire lifetime.
+    pub fn with_shared_model(&self) -> Self {
+        Self {
+            model: Arc::clone(&self.model),
+            cache: DashMap::new(),
+            dimension: self.dimension,
+        }
+    }
+
     /// Generate embedding with caching
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         // Check cache first
@@ -166,6 +177,71 @@ fn default_cache_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    struct TestEmbedder;
+
+    impl Embedder for TestEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            texts.iter().map(|text| self.embed(text)).collect()
+        }
+
+        fn dimension(&self) -> usize {
+            2
+        }
+
+        fn model_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn shared_engine() -> VectorEngine {
+        VectorEngine {
+            model: Arc::new(TestEmbedder),
+            cache: DashMap::new(),
+            dimension: 2,
+        }
+    }
+
+    #[test]
+    fn workspace_cache_is_not_retained_by_shared_model() {
+        let shared = shared_engine();
+        let workspace = shared.with_shared_model();
+        assert!(Arc::ptr_eq(&shared.model, &workspace.model));
+        workspace.embed("workspace symbol").unwrap();
+        assert_eq!(workspace.cache_size(), 1);
+        assert_eq!(shared.cache_size(), 0);
+
+        drop(workspace);
+
+        assert_eq!(Arc::strong_count(&shared.model), 1);
+        assert_eq!(shared.cache_size(), 0);
+    }
+
+    #[test]
+    fn dropping_workspace_keeps_other_workspace_model_available() {
+        let shared = shared_engine();
+        let first = shared.with_shared_model();
+        let second = shared.with_shared_model();
+        first.embed_batch(&["first symbol"]).unwrap();
+        second.embed_batch(&["second symbol"]).unwrap();
+        assert_eq!(first.cache_size(), 1);
+        assert_eq!(second.cache_size(), 1);
+        assert!(Arc::ptr_eq(&first.model, &second.model));
+
+        drop(first);
+
+        assert_eq!(Arc::strong_count(&shared.model), 2);
+        assert_eq!(second.cache_size(), 1);
+        assert_eq!(second.embed("another symbol").unwrap(), vec![1.0, 0.0]);
+        assert_eq!(second.cache_size(), 2);
+        assert_eq!(shared.cache_size(), 0);
+    }
+
     #[test]
     fn test_cosine_similarity() {
         // Test cosine similarity calculation

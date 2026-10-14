@@ -71,20 +71,27 @@ fn now_unix() -> u64 {
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
-    use tokio::sync::Mutex;
+
+    use super::super::workspace_registry::WorkspaceRegistry;
 
     use codegraph_memory::VectorEngine;
 
     /// One slot per workspace. The slot is created under the lock; the load
     /// runs inside it, outside the lock, and every concurrent attach for the
     /// same workspace awaits that one load.
-    type Registry = Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::OnceCell<Arc<McpServer>>>>>>;
+    type Registry = WorkspaceRegistry<tokio::sync::OnceCell<Arc<McpServer>>>;
+
+    struct LoadedWorkspace {
+        // Every connection owns a load slot as well as the server: concurrent
+        // attaches must continue to share that slot until the last disconnect.
+        _slot: Arc<tokio::sync::OnceCell<Arc<McpServer>>>,
+        server: Arc<McpServer>,
+    }
 
     struct Engine {
         cfg: EngineConfig,
@@ -109,15 +116,16 @@ mod imp {
     /// (issue #23). A per-workspace `OnceCell` makes the second attach wait for
     /// the first load instead, while a slow first index of one workspace still
     /// does not block attaches to others.
-    async fn get_or_load(engine: &Arc<Engine>, workspace: PathBuf) -> Arc<McpServer> {
+    async fn get_or_load(engine: &Arc<Engine>, workspace: PathBuf) -> LoadedWorkspace {
         let ws = workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.clone());
-        let slot = {
-            let mut registry = engine.registry.lock().await;
-            Arc::clone(registry.entry(ws.clone()).or_default())
-        };
-        Arc::clone(slot.get_or_init(|| load_workspace(engine, ws)).await)
+        let slot = engine.registry.get_or_create(ws.clone());
+        let server = Arc::clone(slot.get_or_init(|| load_workspace(engine, ws)).await);
+        LoadedWorkspace {
+            _slot: slot,
+            server,
+        }
     }
 
     async fn load_workspace(engine: &Arc<Engine>, ws: PathBuf) -> Arc<McpServer> {
@@ -202,7 +210,7 @@ mod imp {
                     continue;
                 }
             };
-            if let Some(resp) = server.handle_request_shared(req).await {
+            if let Some(resp) = server.server.handle_request_shared(req).await {
                 match serde_json::to_vec(&resp) {
                     Ok(mut bytes) => {
                         bytes.push(b'\n');
@@ -334,15 +342,17 @@ mod imp {
         let seeds = cfg.seeds.clone();
         let engine = Arc::new(Engine {
             cfg,
-            registry: Arc::new(Mutex::new(HashMap::new())),
+            registry: WorkspaceRegistry::default(),
             shared_engine,
             active: AtomicUsize::new(0),
             idle_since: AtomicU64::new(now_unix()),
         });
 
-        // Pre-load any seed workspaces.
+        // Explicit startup seeds stay resident for the engine's lifetime;
+        // workspaces attached by sessions live only while clients own them.
+        let mut _seed_workspaces = Vec::with_capacity(seeds.len());
         for ws in seeds {
-            let _ = get_or_load(&engine, ws).await;
+            _seed_workspaces.push(get_or_load(&engine, ws).await);
         }
 
         // Stale socket from a prior run — safe to clear now (probe above showed
